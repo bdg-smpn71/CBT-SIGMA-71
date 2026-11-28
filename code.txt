@@ -224,40 +224,50 @@ function initializeSheets() {
     }
 
 function checkUserAccess(userID, token, targetSubject, targetClass) {
+  if (!userID || !token) return { allowed: false, message: 'Sesi tidak valid.' };
+
   // 1. Cek Sesi Valid
   const sheet = SS.getSheetByName('Users');
   const data = sheet.getDataRange().getValues();
   let userRow = null;
 
   for (let i = 1; i < data.length; i++) {
-    if (String(data[i][0]) === userID && String(data[i][5]) === token) {
+    if (String(data[i][0]).trim() === String(userID).trim() && String(data[i][5]).trim() === String(token).trim()) {
       userRow = data[i];
       break;
     }
   }
 
   if (!userRow) return { allowed: false, message: 'Sesi tidak valid.' };
+  if (String(userRow[6]).toUpperCase().trim() === 'FALSE') return { allowed: false, message: 'Akun nonaktif.' };
 
-  const role = userRow[3]; // Kolom Role
+  const role = String(userRow[3] || '').trim(); // Kolom Role
   
   // 2. Admin Boleh Segalanya
   if (role === 'Admin') return { allowed: true };
 
-  // 3. Cek Izin Guru
+  // 3. Cek Izin Guru (Mendukung format "Mapel:Kelas" maupun JSON [{"subject":"...","classVal":"..."}])
   if (role === 'Guru') {
-    const assignments = String(userRow[4]).split(','); // Kolom Class berisi tugas (Mapel:Kelas)
-    
+    const parsedAssign = (typeof parseTeacherAssignmentsRaw_ === 'function')
+      ? parseTeacherAssignmentsRaw_(userRow[4])
+      : String(userRow[4] || '').split(',').map(rule => {
+          const parts = rule.split(':');
+          return parts.length >= 2 ? { subject: parts[0].trim(), kelas: parts.slice(1).join(':').trim() } : null;
+        }).filter(Boolean);
+
     // Normalisasi input (kecilkan huruf & hapus spasi)
-    const tSub = String(targetSubject).toLowerCase().trim();
-    const tCls = String(targetClass).toLowerCase().trim();
+    const tSub = String(targetSubject || '').toLowerCase().trim();
+    const tClsList = String(targetClass || '').toLowerCase().split(',').map(c => c.trim()).filter(Boolean);
 
     // Cek apakah Mapel & Kelas cocok dengan salah satu tugas guru
-    const isMatch = assignments.some(rule => {
-      const parts = rule.split(':');
-      if (parts.length < 2) return false;
-      const rSub = parts[0].toLowerCase().trim();
-      const rCls = parts[1].toLowerCase().trim();
-      return (tSub.includes(rSub) && tCls.includes(rCls));
+    const isMatch = parsedAssign.some(rule => {
+      const rSub = String(rule.subject || '').toLowerCase().trim();
+      const rCls = String(rule.kelas || '').toLowerCase().trim();
+      if (!rSub) return false;
+      const subOk = tSub.includes(rSub) || rSub.includes(tSub);
+      if (!subOk) return false;
+      if (!rCls || tClsList.length === 0) return true;
+      return tClsList.some(c => c === rCls || c.includes(rCls) || rCls.includes(c));
     });
 
     if (isMatch) return { allowed: true };
@@ -308,19 +318,165 @@ function verifyAdminAccess(requestorID, requestorToken) {
   return true; // Lolos verifikasi
 }
 
-function loginUser(userIdInput, password, pinSesi, isAdminLogin) {
-  // 1. Cek Status Maintenance Mode dari Sheet Konfigurasi
-  let isMaintenanceActive = false;
+/* ==========================================================================
+   CENTRALIZED CACHE LAYER (CacheService.getScriptCache() — Safe 100KB Limit)
+   ========================================================================== */
+
+function safeCacheGet_(key) {
   try {
-    const cfgSheet = SS.getSheetByName('Konfigurasi');
-    if (cfgSheet) {
-      const cfgData = cfgSheet.getDataRange().getValues();
-      for (let c = 1; c < cfgData.length; c++) {
-        if (String(cfgData[c][0]).trim() === 'maintenance_mode') {
-          isMaintenanceActive = String(cfgData[c][1]).trim().toLowerCase() === 'true';
-          break;
-        }
+    if (typeof CacheService === 'undefined') return null;
+    const raw = CacheService.getScriptCache().get(key);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+function safeCachePut_(key, value, ttlSeconds) {
+  try {
+    if (typeof CacheService === 'undefined') return;
+    const str = JSON.stringify(value);
+    // Batas per key Apps Script CacheService adalah 100KB
+    if (str && str.length < 95000) {
+      CacheService.getScriptCache().put(key, str, ttlSeconds || 300);
+    }
+  } catch (e) {}
+}
+
+function safeCacheRemove_(key) {
+  try {
+    if (typeof CacheService === 'undefined') return;
+    const cache = CacheService.getScriptCache();
+    if (typeof cache.remove === 'function') {
+      cache.remove(key);
+    } else if (typeof cache.put === 'function') {
+      cache.put(key, '', 1);
+    }
+  } catch (e) {}
+}
+
+function getCachedConfigMap_() {
+  const cached = safeCacheGet_('CACHE_CONFIG');
+  if (cached && typeof cached === 'object') return cached;
+
+  const sheet = SS.getSheetByName('Konfigurasi');
+  if (!sheet || sheet.getLastRow() <= 1) return {};
+  const data = sheet.getDataRange().getValues();
+  const config = {};
+  for (let i = 1; i < data.length; i++) {
+    const key = String(data[i][0] || '').trim();
+    if (key) config[key] = data[i][1];
+  }
+  safeCachePut_('CACHE_CONFIG', config, 300);
+  return config;
+}
+
+function getCachedExamsRaw_(forceRefresh) {
+  if (!forceRefresh) {
+    const cached = safeCacheGet_('CACHE_EXAMS');
+    if (Array.isArray(cached)) return cached;
+  }
+
+  const sheet = SS.getSheetByName('Exams');
+  if (!sheet || sheet.getLastRow() <= 1) return [];
+  const data = sheet.getDataRange().getValues();
+  const exams = [];
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    const startVal = r[3] instanceof Date ? r[3].toISOString() : (r[3] || '');
+    const endVal = r[7] instanceof Date ? r[7].toISOString() : (r[7] || '');
+    exams.push({
+      rowIndex: i + 1,
+      id: String(r[0] || ''),
+      subject: String(r[1] || ''),
+      cls: String(r[2] || ''),
+      startDate: startVal,
+      duration: r[4],
+      pin: String(r[5] !== undefined && r[5] !== null ? r[5] : ''),
+      status: String(r[6] || ''),
+      endDate: endVal,
+      shuffleRaw: String(r[8] || ''),
+      examName: String(r[9] || '').trim()
+    });
+  }
+  safeCachePut_('CACHE_EXAMS', exams, 180);
+  return exams;
+}
+
+function getCachedQuestionsByExam_(examID, forceRefresh) {
+  const targetId = String(examID || '').trim();
+  if (!targetId) return [];
+  const cacheKey = 'CACHE_Q_' + targetId;
+
+  if (!forceRefresh) {
+    const cached = safeCacheGet_(cacheKey);
+    if (Array.isArray(cached)) return cached;
+  }
+
+  const qSheet = SS.getSheetByName('Questions');
+  if (!qSheet || qSheet.getLastRow() <= 1) return [];
+  const qData = qSheet.getDataRange().getValues();
+  const list = [];
+  for (let i = 1; i < qData.length; i++) {
+    const row = qData[i];
+    if (String(row[1] || '').trim() === targetId) {
+      const rawW = row.length > 8 ? parseFloat(String(row[8] || '').replace(',', '.')) : NaN;
+      const weight = (!isNaN(rawW) && rawW > 0) ? rawW : 10;
+      list.push([
+        row[0],
+        row[1],
+        row[2],
+        row[3],
+        row[4],
+        row[5],
+        row[6],
+        row[7],
+        weight
+      ]);
+    }
+  }
+  safeCachePut_(cacheKey, list, 300);
+  return list;
+}
+
+function invalidateAppCache_(options) {
+  const opts = options || {};
+  try {
+    if (opts.config || opts.all) {
+      safeCacheRemove_('CACHE_CONFIG');
+    }
+    if (opts.exams || opts.all) {
+      safeCacheRemove_('CACHE_EXAMS');
+    }
+    if (opts.examId) {
+      safeCacheRemove_('CACHE_Q_' + String(opts.examId).trim());
+    }
+    if (Array.isArray(opts.examIds)) {
+      opts.examIds.forEach(id => {
+        if (id) safeCacheRemove_('CACHE_Q_' + String(id).trim());
+      });
+    }
+    if (opts.all) {
+      const eSheet = SS.getSheetByName('Exams');
+      if (eSheet && eSheet.getLastRow() > 1) {
+        const eIds = eSheet.getRange(2, 1, eSheet.getLastRow() - 1, 1).getValues();
+        eIds.forEach(r => {
+          if (r[0]) safeCacheRemove_('CACHE_Q_' + String(r[0]).trim());
+        });
       }
+    }
+  } catch (e) {}
+}
+
+function loginUser(userIdInput, password, pinSesi, isAdminLogin) {
+  // 1. Cek Status Maintenance Mode dari CACHE_CONFIG
+  let isMaintenanceActive = false;
+  let cfgMap = {};
+  try {
+    cfgMap = getCachedConfigMap_();
+    if (cfgMap && cfgMap.maintenance_mode !== undefined) {
+      isMaintenanceActive = String(cfgMap.maintenance_mode).trim().toLowerCase() === 'true';
     }
   } catch (errCfg) {
     Logger.log("Cek Maintenance Mode Error: " + errCfg);
@@ -374,68 +530,67 @@ function loginUser(userIdInput, password, pinSesi, isAdminLogin) {
           return { success: false, message: 'Siswa wajib mengisi PIN Sesi Ujian.' };
         }
 
-        // 1. Validasi PIN ke sheet Exams
+        // 1. Validasi PIN via CACHE_EXAMS
         const check = validateExamPIN(pinSesi, userClass);
         if (!check.valid) {
           return { success: false, message: check.message };
         }
         examData = check.data;
 
-        // ✅ FIX: Cek sheet Responses — apakah siswa sudah Completed?
+        // 2. Cek sheet Responses secara ringan (HANYA baca kolom A:C dan H, tanpa menarik kolom D AnswersJSON)
         const rSheet = SS.getSheetByName('Responses');
-        const rData  = rSheet.getDataRange().getValues();
+        const rLastRow = rSheet ? rSheet.getLastRow() : 0;
         let responseId   = null;
         let isDoneAlready = false;
 
-        for (let j = 1; j < rData.length; j++) {
-          const respUserID = String(rData[j][1]);
-          const respExamID = String(rData[j][2]);
-          const respStatus = String(rData[j][7]).toLowerCase(); // Kolom H = Status
+        if (rLastRow > 1) {
+          const rIds = rSheet.getRange(2, 1, rLastRow - 1, 3).getValues();
+          const rStatuses = rSheet.getRange(2, 8, rLastRow - 1, 1).getValues();
 
-          if (respUserID === String(realUserID) && respExamID === String(examData.id)) {
-            responseId = String(rData[j][0]);
-            if (respStatus === 'completed' || respStatus === 'selesai') {
-              isDoneAlready = true;
-            }
-            break;
-          }
-        }
+          for (let j = 0; j < rIds.length; j++) {
+            const respUserID = String(rIds[j][1]);
+            const respExamID = String(rIds[j][2]);
+            const respStatus = String(rStatuses[j][0] || '').toLowerCase();
 
-        // Jika sudah Completed → kembalikan flag viewResultsOnly (BUKAN error)
-      if (isDoneAlready) {
-        const token = Utilities.getUuid();
-        sheet.getRange(i + 1, 6).setValue(token);
-
-        // Ambil setting show_exam_result dari Konfigurasi
-        const cfgSheet = SS.getSheetByName('Konfigurasi');
-        let showExamResult = true; // default: tampilkan
-        if (cfgSheet) {
-          const cfgData = cfgSheet.getDataRange().getValues();
-          for (let c = 1; c < cfgData.length; c++) {
-            if (String(cfgData[c][0]) === 'show_exam_result') {
-              showExamResult = String(cfgData[c][1]).toLowerCase() !== 'false';
+            if (respUserID === String(realUserID) && respExamID === String(examData.id)) {
+              responseId = String(rIds[j][0]);
+              if (respStatus === 'completed' || respStatus === 'selesai') {
+                isDoneAlready = true;
+              }
               break;
             }
           }
         }
 
-        return {
-          success: true,
-          token: token,
-          role: role,
-          userID: realUserID,
-          username: realName,
-          examData: examData,
-          viewResultsOnly: true,
-          responseId: responseId,
-          showExamResult: showExamResult  // ← tambahan baru
-        };
-      }
+        // Jika sudah Completed → kembalikan flag viewResultsOnly (BUKAN error)
+        if (isDoneAlready) {
+          const token = Utilities.getUuid();
+          sheet.getRange(i + 1, 6).setValue(token);
+          safeCachePut_('SESSION_' + String(realUserID).trim(), token, 21600);
+
+          let showExamResult = true;
+          if (cfgMap && cfgMap.show_exam_result !== undefined) {
+            showExamResult = String(cfgMap.show_exam_result).toLowerCase() !== 'false';
+          }
+
+          return {
+            success: true,
+            token: token,
+            role: role,
+            userID: realUserID,
+            username: realName,
+            examData: examData,
+            viewResultsOnly: true,
+            responseId: responseId,
+            showExamResult: showExamResult
+          };
+        }
       }
 
       // Login normal (Admin, Guru, atau Siswa yang belum Completed)
       const token = Utilities.getUuid();
       sheet.getRange(i + 1, 6).setValue(token);
+      safeCachePut_('SESSION_' + String(realUserID).trim(), token, 21600);
 
       return {
         success: true,
@@ -456,18 +611,12 @@ function loginUser(userIdInput, password, pinSesi, isAdminLogin) {
    TAMBAHAN: CHECK SESSION (UNTUK AUTO LOGIN)
    ----------------------------------------------------------- */
 function checkSession(userID, token) {
-  // Cek Status Maintenance Mode
+  // Cek Status Maintenance Mode dari CACHE_CONFIG
   let isMaintenanceActive = false;
   try {
-    const cfgSheet = SS.getSheetByName('Konfigurasi');
-    if (cfgSheet) {
-      const cfgData = cfgSheet.getDataRange().getValues();
-      for (let c = 1; c < cfgData.length; c++) {
-        if (String(cfgData[c][0]).trim() === 'maintenance_mode') {
-          isMaintenanceActive = String(cfgData[c][1]).trim().toLowerCase() === 'true';
-          break;
-        }
-      }
+    const cfgMap = getCachedConfigMap_();
+    if (cfgMap && cfgMap.maintenance_mode !== undefined) {
+      isMaintenanceActive = String(cfgMap.maintenance_mode).trim().toLowerCase() === 'true';
     }
   } catch (errCfg) {
     Logger.log("Cek Maintenance Mode Error: " + errCfg);
@@ -478,7 +627,6 @@ function checkSession(userID, token) {
   
   for (let i = 1; i < data.length; i++) {
     const dbUserID = String(data[i][0]);
-    // Token ada di kolom index 5 (Kolom F)
     const dbToken = String(data[i][5]); 
     const role = data[i][3];
     const isActive = String(data[i][6]).toUpperCase() === 'TRUE';
@@ -497,16 +645,7 @@ function checkSession(userID, token) {
          };
        }
 
-       // 2. Siapkan data user untuk dikembalikan ke Client
-       // (Strukturnya disamakan dengan return loginUser)
-       let examData = null;
-       const userClass = data[i][4];
-
-       // Jika Siswa, kita perlu cek apakah dia sedang mengerjakan ujian (Opsional, tapi bagus untuk UX)
-       if (role === 'Siswa') {
-          // Logic tambahan jika ingin auto-resume ujian bisa ditaruh sini
-          // Untuk saat ini kita kembalikan data dasar saja
-       }
+       safeCachePut_('SESSION_' + String(userID).trim(), token, 21600);
 
        return { 
           success: true, 
@@ -514,7 +653,7 @@ function checkSession(userID, token) {
           role: role, 
           userID: userID, 
           username: data[i][1],
-          examData: null // Siswa nanti akan diminta masuk PIN lagi atau dilanjut logic frontend
+          examData: null
        };
     }
   }
@@ -523,23 +662,29 @@ function checkSession(userID, token) {
 /* --- GANTI FUNGSI validateExamPIN DI CODE.GS DENGAN INI --- */
 
 function validateExamPIN(pin, userClass) {
-  const sheet = SS.getSheetByName('Exams');
-  const data = sheet.getDataRange().getValues();
-  const now = new Date(); 
+  const cleanPin = String(pin || '').trim();
+  let exams = getCachedExamsRaw_(false);
+  // Jika PIN tidak ditemukan di cache, muat ulang 1x dari Sheet Exams (mengantisipasi edit manual di Sheet)
+  if (!exams.some(ex => String(ex.pin).trim() === cleanPin)) {
+    exams = getCachedExamsRaw_(true);
+  }
 
-  for (let i = 1; i < data.length; i++) {
-    const [id, subject, cls, startDate, rawDuration, examPin, status, endDate] = data[i];
-    
-    const startObj = new Date(startDate);
-    const endObj = endDate ? new Date(endDate) : null;
-    const duration = parseInt(rawDuration);
+  const now = new Date();
+
+  for (let i = 0; i < exams.length; i++) {
+    const ex = exams[i];
+    const id = ex.id;
+    const subject = ex.subject;
+    const cls = ex.cls;
+    const startObj = new Date(ex.startDate);
+    const endObj = ex.endDate ? new Date(ex.endDate) : null;
+    const duration = parseInt(ex.duration);
     const allowedClasses = String(cls).split(',').map(c => c.trim());
 
-    if (String(examPin).trim() === String(pin).trim() && allowedClasses.includes(userClass)) {
-       
-       const examStatus = String(status).toLowerCase();
+    if (String(ex.pin).trim() === cleanPin && allowedClasses.includes(userClass)) {
+       const examStatus = String(ex.status).toLowerCase();
 
-       // ✅ BARU: Ujian sudah selesai/completed → siswa bisa lihat hasil
+       // Ujian sudah selesai/completed → siswa bisa lihat hasil
        if (examStatus === 'completed' || examStatus === 'selesai') {
            return { valid: true, data: { id, subject, duration: isNaN(duration) ? 60 : duration }, viewResultsOnly: true };
        }
@@ -554,7 +699,11 @@ function validateExamPIN(pin, userClass) {
        }
 
        if (endObj && now > endObj) {
-           sheet.getRange(i + 1, 7).setValue('Non-Aktif');
+           const sheet = SS.getSheetByName('Exams');
+           if (sheet && ex.rowIndex) {
+             sheet.getRange(ex.rowIndex, 7).setValue('Non-Aktif');
+           }
+           invalidateAppCache_({ exams: true });
            return { valid: false, message: 'Waktu ujian telah berakhir.' };
        }
 
@@ -570,6 +719,7 @@ function validateExamPIN(pin, userClass) {
 }
 
 function logoutUser(userID) {
+  safeCacheRemove_('SESSION_' + String(userID || '').trim());
   const sheet = SS.getSheetByName('Users');
   const data = sheet.getDataRange().getValues();
   for (let i = 1; i < data.length; i++) {
@@ -581,10 +731,23 @@ function logoutUser(userID) {
 }
 
 function isValidSession(userID, token) {
+  if (!userID || !token) return false;
+  const uidKey = 'SESSION_' + String(userID).trim();
+  const cachedToken = safeCacheGet_(uidKey);
+  if (cachedToken && String(cachedToken) === String(token)) {
+    return true;
+  }
+
   const sheet = SS.getSheetByName('Users');
   const data = sheet.getDataRange().getValues();
   for (let i = 1; i < data.length; i++) {
-    if (data[i][0] == userID) return data[i][5] === token;
+    if (data[i][0] == userID) {
+      const isMatch = data[i][5] === token;
+      if (isMatch) {
+        safeCachePut_(uidKey, String(token), 21600);
+      }
+      return isMatch;
+    }
   }
   return false;
 }
@@ -596,94 +759,107 @@ function isValidSession(userID, token) {
 function getExamQuestions(examID, userID, token) {
   
   // ==========================================================
-  // 1. VALIDASI SESI & SECURITY CHECK
+  // 1. VALIDASI SESI & SECURITY CHECK (DARI CACHE SESSION)
   // ==========================================================
-  // Cek apakah user login dengan token yang sah
   if (!isValidSession(userID, token)) {
       return { error: 'Sesi habis. Login di perangkat lain terdeteksi.' };
   }
 
   const respSheet = SS.getSheetByName('Responses');
-  const respData = respSheet.getDataRange().getValues();
+  const rLastRow = respSheet ? respSheet.getLastRow() : 0;
   let savedAnswers = {};
   let hasExistingResponse = false;
 
   // ==========================================================
-  // 2. CEK STATUS SISWA (RESUME / SELESAI / CURANG)
+  // 2. CEK STATUS SISWA (BACA HANYA KOLOM B:C & H, BACA KOLOM D HANYA JIKA IN PROGRESS)
   // ==========================================================
-  for(let i=1; i<respData.length; i++) {
-    // Cek UserID (Kolom B/Index 1) dan ExamID (Kolom C/Index 2)
-    if(String(respData[i][1]).trim() === String(userID).trim() && String(respData[i][2]).trim() === String(examID).trim()) {
+  if (rLastRow > 1) {
+    const respIds = respSheet.getRange(2, 2, rLastRow - 1, 2).getValues();
+    const respStatuses = respSheet.getRange(2, 8, rLastRow - 1, 1).getValues();
+
+    for (let i = 0; i < respIds.length; i++) {
+      if (String(respIds[i][0]).trim() === String(userID).trim() &&
+          String(respIds[i][1]).trim() === String(examID).trim()) {
         hasExistingResponse = true;
-        const currentStatus = String(respData[i][7] || '').trim(); // Kolom H (Status)
+        const rowIdx = i + 2;
+        const currentStatus = String(respStatuses[i][0] || '').trim();
 
         // A. Blokir jika sudah Selesai
-        if(currentStatus === 'Completed' || currentStatus === 'Selesai') {
-            return { error: 'Anda sudah menyelesaikan ujian ini.' };
+        if (currentStatus === 'Completed' || currentStatus === 'Selesai') {
+          return { error: 'Anda sudah menyelesaikan ujian ini.' };
         }
 
         // B. Blokir jika Didiskualifikasi (Curang)
-        if(currentStatus === 'Curang') {
-             return { error: 'AKSES DITOLAK: Anda telah didiskualifikasi dari ujian ini karena terdeteksi melakukan kecurangan.' };
+        if (currentStatus === 'Curang') {
+          return { error: 'AKSES DITOLAK: Anda telah didiskualifikasi dari ujian ini karena terdeteksi melakukan kecurangan.' };
         }
 
-        // C. Jika status aman (In Progress), muat jawaban yang tersimpan (Resume)
+        // C. Jika status aman (In Progress), baca kolom D (AnswersJSON) HANYA untuk 1 baris siswa ini
         try {
-          savedAnswers = JSON.parse(respData[i][3] || '{}');
-        } catch(e) {
+          const rawAnsJson = respSheet.getRange(rowIdx, 4).getValue();
+          savedAnswers = JSON.parse(rawAnsJson || '{}');
+        } catch (e) {
           savedAnswers = {};
         }
         break;
+      }
     }
   }
 
   // ==========================================================
-  // 2B. CATAT STATUS AWAL 'In Progress' SAAT SISWA MULAI UJIAN
-  //     (Agar langsung tampil di Monitoring Ujian Real-time)
+  // 2B. CATAT STATUS AWAL 'In Progress' (NON-BLOCKING tryLock(2500) & TANPA flush)
   // ==========================================================
-  if (!hasExistingResponse) {
+  if (!hasExistingResponse && respSheet) {
     const startLock = LockService.getScriptLock();
+    let gotLock = false;
     try {
-      startLock.waitLock(10000);
-      const freshLastRow = respSheet.getLastRow();
-      let alreadyCreated = false;
-      if (freshLastRow > 1) {
-        const freshIds = respSheet.getRange(2, 2, freshLastRow - 1, 2).getValues();
-        for (let k = 0; k < freshIds.length; k++) {
-          if (String(freshIds[k][0]).trim() === String(userID).trim() &&
-              String(freshIds[k][1]).trim() === String(examID).trim()) {
-            alreadyCreated = true;
-            break;
+      gotLock = (typeof startLock.tryLock === 'function')
+        ? startLock.tryLock(2500)
+        : (startLock.waitLock(2500), true);
+      if (gotLock) {
+        const freshLastRow = respSheet.getLastRow();
+        let alreadyCreated = false;
+        if (freshLastRow > 1) {
+          const freshIds = respSheet.getRange(2, 2, freshLastRow - 1, 2).getValues();
+          for (let k = 0; k < freshIds.length; k++) {
+            if (String(freshIds[k][0]).trim() === String(userID).trim() &&
+                String(freshIds[k][1]).trim() === String(examID).trim()) {
+              alreadyCreated = true;
+              break;
+            }
           }
         }
-      }
-      if (!alreadyCreated) {
-        const newRespID = 'RSP-' + Date.now() + '-' + Math.floor(Math.random() * 1000);
-        respSheet.appendRow([
-          newRespID,
-          userID,
-          examID,
-          '{}',
-          0,
-          new Date(),
-          '',
-          'In Progress'
-        ]);
-        SpreadsheetApp.flush();
+        if (!alreadyCreated) {
+          const newRespID = 'RSP-' + Date.now() + '-' + Math.floor(Math.random() * 1000);
+          respSheet.appendRow([
+            newRespID,
+            userID,
+            examID,
+            '{}',
+            0,
+            new Date(),
+            '',
+            'In Progress'
+          ]);
+        }
       }
     } catch (lockErr) {
       Logger.log('Init In Progress lock warning: ' + lockErr);
     } finally {
-      try { startLock.releaseLock(); } catch (e) {}
+      if (gotLock) {
+        try { startLock.releaseLock(); } catch (e) {}
+      }
     }
   }
 
   // ==========================================================
-  // 3. AMBIL DATA SOAL (DENGAN PENGELOMPOKAN TIPE)
+  // 3. AMBIL DATA SOAL DARI CACHE_Q_<examID>
   // ==========================================================
-  const qSheet = SS.getSheetByName('Questions');
-  const qData = qSheet.getDataRange().getValues();
-  
+  let examQuestionsRows = getCachedQuestionsByExam_(examID, false);
+  if (examQuestionsRows.length === 0) {
+    examQuestionsRows = getCachedQuestionsByExam_(examID, true);
+  }
+
   // Siapkan "Keranjang" untuk setiap jenis soal
   let listPG = [];
   let listPG_Kompleks = [];
@@ -691,46 +867,47 @@ function getExamQuestions(examID, userID, token) {
   let listJodoh = [];
   let listEsai = [];
 
-  // Loop data soal (mulai index 1 untuk lewati header)
-  for (let index = 1; index < qData.length; index++) {
-    const row = qData[index];
+  for (let index = 0; index < examQuestionsRows.length; index++) {
+    const row = examQuestionsRows[index];
 
-    // Filter hanya soal untuk ExamID yang sedang diminta
-    if (String(row[1]) === String(examID)) {
-      
-      // Susun objek soal (Sanitized: Tanpa Kunci Jawaban)
-      const qObj = {
-        id: row[0],
-        type: row[2],
-        content: row[3],
-        image: row[4],
-        options: row[5] ? JSON.parse(row[5]) : [],
-        // PENTING: Row[6] (CorrectAnswer) TIDAK dikirim ke client
-        isRequired: row[7] 
-      };
-
-      // Masukkan ke keranjang berdasarkan Tipe Soal
-      const type = String(row[2]).trim();
-
-      if (type === 'PG') {
-        listPG.push(qObj);
-      } else if (type === 'PG_KOMPLEKS') {
-        listPG_Kompleks.push(qObj);
-      } else if (type === 'BS') {
-        listBS.push(qObj);
-      } else if (type === 'JODOH') {
-        listJodoh.push(qObj);
-      } else if (type === 'Esai') {
-        listEsai.push(qObj);
+    let parsedOpts = [];
+    if (row[5]) {
+      try {
+        parsedOpts = (typeof row[5] === 'string') ? JSON.parse(row[5]) : row[5];
+      } catch (e) {
+        parsedOpts = [];
       }
+    }
+
+    // Susun objek soal (Sanitized: Tanpa Kunci Jawaban)
+    const qObj = {
+      id: row[0],
+      type: row[2],
+      content: row[3],
+      image: row[4],
+      options: parsedOpts,
+      // PENTING: Row[6] (CorrectAnswer) TIDAK dikirim ke client
+      isRequired: row[7]
+    };
+
+    const type = String(row[2]).trim();
+
+    if (type === 'PG') {
+      listPG.push(qObj);
+    } else if (type === 'PG_KOMPLEKS') {
+      listPG_Kompleks.push(qObj);
+    } else if (type === 'BS') {
+      listBS.push(qObj);
+    } else if (type === 'JODOH') {
+      listJodoh.push(qObj);
+    } else if (type === 'Esai') {
+      listEsai.push(qObj);
     }
   }
 
   // ==========================================================
-  // 4. LOGIKA PENGACAKAN (SHUFFLE) PER KELOMPOK
+  // 4. LOGIKA PENGACAKAN (SHUFFLE) PER KELOMPOK (DARI CACHE_EXAMS)
   // ==========================================================
-  
-  // Fungsi Helper Fisher-Yates Shuffle
   const shuffleArray = (array) => {
     for (let i = array.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -739,27 +916,22 @@ function getExamQuestions(examID, userID, token) {
     return array;
   };
 
-// Baca ShuffleConfig dari sheet Exams
-  const examSheet = SS.getSheetByName('Exams');
-  const examRows  = examSheet.getDataRange().getValues();
-  let shuffleCfg  = { PG: false, PG_KOMPLEKS: false, BS: false, JODOH: false, Esai: false };
-  for (let ei = 1; ei < examRows.length; ei++) {
-    if (String(examRows[ei][0]) === String(examID)) {
-      const raw = examRows[ei][8]; // Kolom I (index 8) = ShuffleConfig
-      if (raw) { try { shuffleCfg = JSON.parse(raw); } catch(e) {} }
-      break;
-    }
+  let shuffleCfg = { PG: false, PG_KOMPLEKS: false, BS: false, JODOH: false, Esai: false };
+  const cachedExams = getCachedExamsRaw_(false);
+  const foundExam = cachedExams.find(ex => String(ex.id) === String(examID));
+  if (foundExam && foundExam.shuffleRaw) {
+    try { shuffleCfg = JSON.parse(foundExam.shuffleRaw); } catch (e) {}
   }
+
   if (shuffleCfg.PG)          shuffleArray(listPG);
-    if (shuffleCfg.PG_KOMPLEKS) shuffleArray(listPG_Kompleks);
-    if (shuffleCfg.BS)          shuffleArray(listBS);
-    if (shuffleCfg.JODOH)       shuffleArray(listJodoh);
-    if (shuffleCfg.Esai)        shuffleArray(listEsai);
+  if (shuffleCfg.PG_KOMPLEKS) shuffleArray(listPG_Kompleks);
+  if (shuffleCfg.BS)          shuffleArray(listBS);
+  if (shuffleCfg.JODOH)       shuffleArray(listJodoh);
+  if (shuffleCfg.Esai)        shuffleArray(listEsai);
 
   // ==========================================================
   // 5. GABUNGKAN KEMBALI (SESUAI URUTAN YANG DIMINTA)
   // ==========================================================
-  // Urutan: PG -> PG Kompleks -> BS -> Jodoh -> Esai
   const finalQuestions = [
     ...listPG, 
     ...listPG_Kompleks, 
@@ -776,377 +948,336 @@ function getExamQuestions(examID, userID, token) {
 
 /**
  * Fungsi untuk menyimpan jawaban siswa ke Database (Sheet Responses).
- * PERBAIKAN: Menggunakan LockService untuk menangani 100+ siswa bersamaan.
+ * Menggunakan tryLock(3000) non-blocking dan tanpa SpreadsheetApp.flush() agar lock dilepas <150ms.
  */
 function syncAnswers(userID, examID, answers, violationCount) {
-  // 1. Dapatkan Lock (Kunci) agar tidak ada dua siswa menulis di detik yang sama
   const lock = LockService.getScriptLock();
-  
+  let gotLock = false;
   try {
-    // Tunggu antrean maksimal 10 detik. Jika server sibuk, lempar error.
-    lock.waitLock(10000); 
+    gotLock = (typeof lock.tryLock === 'function')
+      ? lock.tryLock(3000)
+      : (lock.waitLock(3000), true);
   } catch (e) {
-    return { 
-      status: 'error', 
-      message: 'Server sedang sibuk, jawaban akan dikirim ulang otomatis sebentar lagi.' 
+    gotLock = false;
+  }
+
+  if (!gotLock) {
+    return {
+      status: 'busy',
+      message: 'Antrean padat, akan disinkronkan pada siklus berikutnya.'
     };
   }
 
   try {
     const sheet = SS.getSheetByName('Responses');
-    
-    // Optimasi: Membaca seluruh data memakan waktu lama. 
-    // Kita baca kolom UserID (B) dan ExamID (C) saja untuk pencarian cepat.
     const lastRow = sheet.getLastRow();
     let rowIdx = -1;
 
-    // Jika ada data (baris > 1), lakukan pencarian
     if (lastRow > 1) {
-      // Ambil data dari baris 2 sampai baris terakhir, kolom 2 (UserID) dan 3 (ExamID)
-      // getValues() mengembalikan array 2D: [[UserID, ExamID], [UserID, ExamID], ...]
       const dataIds = sheet.getRange(2, 2, lastRow - 1, 2).getValues();
-
-      // Loop mencari posisi baris siswa
       for (let i = 0; i < dataIds.length; i++) {
-        // dataIds[i][0] adalah UserID, dataIds[i][1] adalah ExamID
         if (dataIds[i][0] == userID && dataIds[i][1] == examID) {
-          rowIdx = i + 2; // +2 karena array mulai dari 0 tapi baris sheet mulai dari 2 (setelah header)
+          rowIdx = i + 2;
           break;
         }
       }
     }
 
-    // Konversi jawaban ke String JSON
-    // Opsional: Anda bisa memasukkan violationCount ke dalam JSON jika ingin menyimpannya
     const ansJSON = JSON.stringify(answers);
 
-    if (rowIdx === -1) { 
-      // --- KASUS: DATA BARU (APPEND) ---
+    if (rowIdx === -1) {
       const newID = 'RSP-' + Date.now() + '-' + Math.floor(Math.random() * 1000);
-      
-      // Struktur kolom: 
-      // [ResponseID, UserID, ExamID, AnswersJSON, Score, StartTime, SubmitTime, Status]
       sheet.appendRow([
-        newID, 
-        userID, 
-        examID, 
-        ansJSON, 
-        0,          // Score awal 0
-        new Date(), // StartTime
-        '',         // SubmitTime kosong
+        newID,
+        userID,
+        examID,
+        ansJSON,
+        0,
+        new Date(),
+        '',
         'In Progress'
       ]);
-
-    } else { 
+    } else {
       // Jangan timpa jawaban jika ujian sudah selesai atau didiskualifikasi
       const existingStatus = String(sheet.getRange(rowIdx, 8).getValue() || '').toLowerCase().trim();
       if (existingStatus === 'completed' || existingStatus === 'selesai' || existingStatus === 'curang') {
         return { status: 'locked', message: 'Ujian sudah berakhir.' };
       }
-
-      // --- KASUS: UPDATE DATA LAMA (SET VALUE) ---
-      // Update Kolom 4 (AnswersJSON)
       sheet.getRange(rowIdx, 4).setValue(ansJSON);
     }
 
-    // Paksa Spreadsheet untuk menyimpan perubahan SEKARANG sebelum melepas lock
-    SpreadsheetApp.flush();
-    
     return { status: 'success', message: 'Jawaban tersimpan.' };
 
   } catch (err) {
-    // Tangkap error jika ada masalah logika
     return { status: 'error', message: err.toString() };
-
   } finally {
-    // 3. Pastikan Lock SELALU dilepas, baik sukses maupun error
-    lock.releaseLock();
+    try { lock.releaseLock(); } catch (e) {}
   }
 }
 
 /**
- * Fungsi Submit Ujian (Lengkap dengan Perbaikan PG Kompleks & Nilai Parsial)
+ * Fungsi Submit Ujian
+ * Perhitungan skor dilakukan DI LUAR LockService menggunakan CACHE_Q_<examID>,
+ * sedangkan LockService.waitLock(25000) HANYA membungkus operasi tulis ke sheet Responses.
  */
 function submitExam(userID, examID, answers, customStatus) {
-  const lock = LockService.getScriptLock();
   try {
-    lock.waitLock(15000);
-  } catch(e) {
-    return { success: false, message: 'Server sedang sibuk, coba lagi.' };
-  }
-  try {
-  const qSheet = SS.getSheetByName('Questions');
-  const qData = qSheet.getDataRange().getValues();
-  
-  let totalPoints = 0;
-  let maxPoints   = 0;
-
-  // ============================================================
-  // HELPER: Strip HTML + trim + lowercase
-  // Diperlukan karena TinyMCE menyimpan teks opsi sebagai HTML
-  // Contoh: "<p>Karnivora</p>" → "karnivora"
-  // ============================================================
-  function stripHtml(str) {
-    return String(str || '')
-      .replace(/<[^>]*>/g, ' ')   // hapus semua tag HTML
-      .replace(/&nbsp;/gi, ' ')   // ganti entity spasi
-      .replace(/\s+/g, ' ')       // rapikan spasi ganda
-      .trim()
-      .toLowerCase();
-  }
-
-  // ============================================================
-  // LOGIKA SCORING — LOOP SETIAP SOAL
-  // ============================================================
-  qData.forEach((row, i) => {
-    if (i === 0 || String(row[1]) !== String(examID)) return;
-
-    const qid     = row[0];           // Question ID   (Col A)
-    const type    = String(row[2]).trim(); // Tipe Soal (Col C)
-    const keyRaw  = row[6];           // Kunci Jawaban (Col G)
-    const userAns = answers[qid];     // Jawaban Siswa
-    const rawW    = row.length > 8 ? parseFloat(String(row[8] || '').replace(',', '.')) : NaN;
-    const weight  = (!isNaN(rawW) && rawW > 0) ? rawW : 10; // Bobot (Col I)
-
-    maxPoints += weight;
-
-    // ==========================================================
-    // A. PILIHAN GANDA BIASA (PG)
-    // ==========================================================
-    // Frontend menyimpan TEKS opsi (bukan huruf), contoh: "Karnivora"
-    // Kunci guru bisa berupa huruf ("B") ATAU teks langsung ("Karnivora")
-    // ==========================================================
-    if (type === 'PG') {
-
-      const cleanUser = stripHtml(userAns);
-      const cleanKey  = String(keyRaw || '').trim();
-
-      let isCorrect = false;
-      const mapHuruf = ['A', 'B', 'C', 'D', 'E'];
-      const keyIndex = mapHuruf.indexOf(cleanKey.trim().toUpperCase());
-
-      if (keyIndex !== -1) {
-        // Kunci adalah HURUF → ambil teks opsi yang sesuai, lalu bandingkan
-        let optionsArr = [];
-        try { optionsArr = JSON.parse(row[5]); } catch (e) { optionsArr = []; }
-
-        if (optionsArr[keyIndex]) {
-          const correctText = stripHtml(optionsArr[keyIndex]);
-          if (cleanUser === correctText && correctText !== '') isCorrect = true;
-        }
-      } else {
-        // Kunci adalah TEKS LANGSUNG → bandingkan langsung
-        if (cleanUser === stripHtml(cleanKey)) isCorrect = true;
-      }
-
-      if (isCorrect) totalPoints += weight;
+    // ============================================================
+    // 1. AMBIL SOAL & HITUNG SKOR DI LUAR LOCKSERVICE (NON-BLOCKING)
+    // ============================================================
+    let examQuestionsRows = getCachedQuestionsByExam_(examID, false);
+    if (examQuestionsRows.length === 0) {
+      examQuestionsRows = getCachedQuestionsByExam_(examID, true);
     }
 
-    // ==========================================================
-    // B. PILIHAN GANDA KOMPLEKS (PG_KOMPLEKS)
-    // ==========================================================
-    // Frontend menyimpan array TEKS opsi: ["Karnivora", "Omnivora"]
-    // Kunci guru SELALU array HURUF: ["A", "C"]
-    // Fix: konversi huruf kunci → teks opsi → bandingkan
-    // ==========================================================
-    else if (type === 'PG_KOMPLEKS') {
+    let totalPoints = 0;
+    let maxPoints   = 0;
+    const safeAnswers = (answers && typeof answers === 'object') ? answers : {};
 
-      // --- 1. Parse kunci jawaban (array huruf) ---
-      let keyArr = [];
-      try {
-        const parsed = JSON.parse(keyRaw);
-        keyArr = Array.isArray(parsed) ? parsed : [];
-      } catch (e) {
-        keyArr = String(keyRaw || '').split(',').map(s => s.trim()).filter(s => s);
-      }
+    function stripHtml(str) {
+      return String(str || '')
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+    }
 
-      // --- 2. Parse jawaban siswa (array teks) ---
-      let userArr = [];
-      if (Array.isArray(userAns)) {
-        userArr = userAns;
-      } else {
-        try {
-          const parsed = JSON.parse(userAns);
-          userArr = Array.isArray(parsed) ? parsed : [];
-        } catch (e) {
-          userArr = String(userAns || '').split(',').map(s => s.trim()).filter(s => s);
-        }
-      }
+    examQuestionsRows.forEach((row) => {
+      if (String(row[1]) !== String(examID)) return;
 
-      // --- 3. Parse opsi untuk konversi huruf → teks ---
-      let optionsArr = [];
-      try {
-        const parsed = JSON.parse(row[5]);
-        optionsArr = Array.isArray(parsed) ? parsed : [];
-      } catch (e) { optionsArr = []; }
+      const qid     = row[0];                 // Question ID   (Col A)
+      const type    = String(row[2]).trim();  // Tipe Soal     (Col C)
+      const keyRaw  = row[6];                 // Kunci Jawaban (Col G)
+      const userAns = safeAnswers[qid];       // Jawaban Siswa
+      const rawW    = row.length > 8 ? parseFloat(String(row[8] || '').replace(',', '.')) : NaN;
+      const weight  = (!isNaN(rawW) && rawW > 0) ? rawW : 10; // Bobot (Col I)
 
-      const mapHuruf = ['A', 'B', 'C', 'D', 'E'];
+      maxPoints += weight;
 
-      // --- 4. Konversi kunci huruf → teks opsi (strip HTML) ---
-      // ["A","C"] + options["Karnivora","Omnivora",...] → ["karnivora","omnivora"]
-      const realKeyValues = keyArr
-        .map(k => {
-          const cleanK = String(k).trim().toUpperCase();
-          const idx    = mapHuruf.indexOf(cleanK);
-          if (idx !== -1 && optionsArr[idx]) {
-            return stripHtml(optionsArr[idx]);  // huruf → teks bersih
+      // A. PILIHAN GANDA BIASA (PG)
+      if (type === 'PG') {
+        const cleanUser = stripHtml(userAns);
+        const cleanKey  = String(keyRaw || '').trim();
+
+        let isCorrect = false;
+        const mapHuruf = ['A', 'B', 'C', 'D', 'E'];
+        const keyIndex = mapHuruf.indexOf(cleanKey.trim().toUpperCase());
+
+        if (keyIndex !== -1) {
+          let optionsArr = [];
+          try { optionsArr = (typeof row[5] === 'string') ? JSON.parse(row[5]) : row[5]; } catch (e) { optionsArr = []; }
+
+          if (optionsArr && optionsArr[keyIndex]) {
+            const correctText = stripHtml(optionsArr[keyIndex]);
+            if (cleanUser === correctText && correctText !== '') isCorrect = true;
           }
-          return stripHtml(k);                 // sudah teks → bersihkan saja
-        })
-        .filter(v => v !== '');
-
-      // --- 5. Normalisasi jawaban siswa ---
-      const realUserValues = userArr
-        .map(u => stripHtml(u))
-        .filter(v => v !== '');
-
-      // --- 6. Hitung benar/salah ---
-      let matchCount = 0;
-      let wrongCount = 0;
-
-      realUserValues.forEach(val => {
-        if (realKeyValues.includes(val)) matchCount++;
-        else                             wrongCount++;
-      });
-
-      // --- 7. Beri poin hanya jika nol jawaban salah ---
-      // Partial score: (benar / total kunci) × bobot
-      if (wrongCount === 0 && matchCount > 0 && realKeyValues.length > 0) {
-        totalPoints += (matchCount / realKeyValues.length) * weight;
-      }
-    }
-
-    // ==========================================================
-    // C. BENAR / SALAH (BS)
-    // ==========================================================
-    else if (type === 'BS') {
-      let keyObj = {};
-      try { keyObj = JSON.parse(keyRaw); } catch (e) {
-        // Fallback format lama (single value)
-        if (String(userAns || '').toLowerCase() === String(keyRaw || '').toLowerCase()) {
-          totalPoints += weight;
+        } else {
+          if (cleanUser === stripHtml(cleanKey)) isCorrect = true;
         }
-        return;
+
+        if (isCorrect) totalPoints += weight;
       }
 
-      const ansObj    = (typeof userAns === 'object' && userAns !== null) ? userAns : {};
-      const totalRows = Object.keys(keyObj).length;
-
-      if (totalRows > 0) {
-        let matches = 0;
-        for (const idx in keyObj) {
-          const kVal = String(keyObj[idx]).trim().toLowerCase();
-          const uVal = String(ansObj[idx] || '').trim().toLowerCase();
-
-          const isMatch = (kVal === uVal)
-            || (kVal === 'benar'  && uVal === 'sesuai')
-            || (kVal === 'salah'  && uVal === 'tidak sesuai');
-
-          if (isMatch) matches++;
+      // B. PILIHAN GANDA KOMPLEKS (PG_KOMPLEKS)
+      else if (type === 'PG_KOMPLEKS') {
+        let keyArr = [];
+        try {
+          const parsed = JSON.parse(keyRaw);
+          keyArr = Array.isArray(parsed) ? parsed : [];
+        } catch (e) {
+          keyArr = String(keyRaw || '').split(',').map(s => s.trim()).filter(s => s);
         }
-        totalPoints += (matches / totalRows) * weight;
-      }
-    }
 
-    // ==========================================================
-    // D. MENJODOHKAN (JODOH)
-    // ==========================================================
-    else if (type === 'JODOH') {
-      let correctPairs = [];
-      try { correctPairs = JSON.parse(row[5]); } catch (e) { correctPairs = []; }
+        let userArr = [];
+        if (Array.isArray(userAns)) {
+          userArr = userAns;
+        } else {
+          try {
+            const parsed = JSON.parse(userAns);
+            userArr = Array.isArray(parsed) ? parsed : [];
+          } catch (e) {
+            userArr = String(userAns || '').split(',').map(s => s.trim()).filter(s => s);
+          }
+        }
 
-      if (correctPairs.length > 0 && userAns && typeof userAns === 'object') {
-        let matches = 0;
-        correctPairs.forEach(pair => {
-          if (userAns[pair.q] === pair.a) matches++;
+        let optionsArr = [];
+        try {
+          const parsed = (typeof row[5] === 'string') ? JSON.parse(row[5]) : row[5];
+          optionsArr = Array.isArray(parsed) ? parsed : [];
+        } catch (e) { optionsArr = []; }
+
+        const mapHuruf = ['A', 'B', 'C', 'D', 'E'];
+
+        const realKeyValues = keyArr
+          .map(k => {
+            const cleanK = String(k).trim().toUpperCase();
+            const idx    = mapHuruf.indexOf(cleanK);
+            if (idx !== -1 && optionsArr[idx]) {
+              return stripHtml(optionsArr[idx]);
+            }
+            return stripHtml(k);
+          })
+          .filter(v => v !== '');
+
+        const realUserValues = userArr
+          .map(u => stripHtml(u))
+          .filter(v => v !== '');
+
+        let matchCount = 0;
+        let wrongCount = 0;
+
+        realUserValues.forEach(val => {
+          if (realKeyValues.includes(val)) matchCount++;
+          else                             wrongCount++;
         });
-        totalPoints += (matches / correctPairs.length) * weight;
+
+        if (wrongCount === 0 && matchCount > 0 && realKeyValues.length > 0) {
+          totalPoints += (matchCount / realKeyValues.length) * weight;
+        }
       }
+
+      // C. BENAR / SALAH (BS)
+      else if (type === 'BS') {
+        let keyObj = {};
+        try { keyObj = JSON.parse(keyRaw); } catch (e) {
+          if (String(userAns || '').toLowerCase() === String(keyRaw || '').toLowerCase()) {
+            totalPoints += weight;
+          }
+          return;
+        }
+
+        const ansObj    = (typeof userAns === 'object' && userAns !== null) ? userAns : {};
+        const totalRows = Object.keys(keyObj).length;
+
+        if (totalRows > 0) {
+          let matches = 0;
+          for (const idx in keyObj) {
+            const kVal = String(keyObj[idx]).trim().toLowerCase();
+            const uVal = String(ansObj[idx] || '').trim().toLowerCase();
+
+            const isMatch = (kVal === uVal)
+              || (kVal === 'benar'  && uVal === 'sesuai')
+              || (kVal === 'salah'  && uVal === 'tidak sesuai');
+
+            if (isMatch) matches++;
+          }
+          totalPoints += (matches / totalRows) * weight;
+        }
+      }
+
+      // D. MENJODOHKAN (JODOH)
+      else if (type === 'JODOH') {
+        let correctPairs = [];
+        try { correctPairs = (typeof row[5] === 'string') ? JSON.parse(row[5]) : row[5]; } catch (e) { correctPairs = []; }
+
+        if (Array.isArray(correctPairs) && correctPairs.length > 0 && userAns && typeof userAns === 'object') {
+          let matches = 0;
+          correctPairs.forEach(pair => {
+            if (userAns[pair.q] === pair.a) matches++;
+          });
+          totalPoints += (matches / correctPairs.length) * weight;
+        }
+      }
+      // E. ESAI → dinilai manual, poin otomatis 0
+    });
+
+    const finalScore  = maxPoints > 0 ? Math.round((totalPoints / maxPoints) * 100) : 0;
+    const finalStatus = customStatus || 'Completed';
+    const ansJSON     = JSON.stringify(safeAnswers);
+
+    // ============================================================
+    // 2. LOCK HANYA UNTUK OPERASI TULIS KE SHEET RESPONSES
+    // ============================================================
+    const lock = LockService.getScriptLock();
+    try {
+      lock.waitLock(25000);
+    } catch (e) {
+      return { success: false, retryable: true, message: 'Server sedang sibuk, coba lagi.' };
     }
 
-    // ==========================================================
-    // E. ESAI → dinilai manual, poin otomatis 0
-    // ==========================================================
-    // (tidak ada kode, maxPoints sudah bertambah di atas)
+    try {
+      const rSheet = SS.getSheetByName('Responses');
+      const lastRow = rSheet.getLastRow();
+      let rowIdx = -1;
 
-  }); // end forEach
+      if (lastRow > 1) {
+        const rIds = rSheet.getRange(2, 2, lastRow - 1, 2).getValues();
+        for (let i = 0; i < rIds.length; i++) {
+          if (String(rIds[i][0]) === String(userID) && String(rIds[i][1]) === String(examID)) {
+            rowIdx = i + 2;
+            break;
+          }
+        }
+      }
 
-  // ============================================================
-  // HITUNG SKOR AKHIR (SKALA 0–100)
-  // ============================================================
-  const finalScore  = maxPoints > 0 ? Math.round((totalPoints / maxPoints) * 100) : 0;
-  const finalStatus = customStatus || 'Completed';
+      if (rowIdx !== -1) {
+        // Operasi tulis batch minimal agar StartTime (kolom F / index 6) tetap utuh
+        rSheet.getRange(rowIdx, 4, 1, 2).setValues([[ansJSON, finalScore]]);
+        rSheet.getRange(rowIdx, 7, 1, 2).setValues([[new Date(), finalStatus]]);
+      } else {
+        rSheet.appendRow([
+          'RSP-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
+          userID,
+          examID,
+          ansJSON,
+          finalScore,
+          new Date(), // StartTime
+          new Date(), // SubmitTime
+          finalStatus
+        ]);
+      }
 
-  // ============================================================
-  // SIMPAN KE SHEET RESPONSES
-  // ============================================================
-  const rSheet = SS.getSheetByName('Responses');
-  const rData  = rSheet.getDataRange().getValues();
-  let saved    = false;
-
-  for (let i = 1; i < rData.length; i++) {
-    if (String(rData[i][1]) === String(userID) && String(rData[i][2]) === String(examID)) {
-      const rowIdx = i + 1;
-      rSheet.getRange(rowIdx, 4).setValue(JSON.stringify(answers)); // Col D: AnswersJSON
-      rSheet.getRange(rowIdx, 5).setValue(finalScore);              // Col E: Score
-      rSheet.getRange(rowIdx, 7).setValue(new Date());              // Col G: SubmitTime
-      rSheet.getRange(rowIdx, 8).setValue(finalStatus);             // Col H: Status
-      saved = true;
-      break;
-    }
-  }
-
-  if (!saved) {
-    rSheet.appendRow([
-      'RSP-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
-      userID,
-      examID,
-      JSON.stringify(answers),
-      finalScore,
-      new Date(), // StartTime
-      new Date(), // SubmitTime
-      finalStatus
-    ]);
-  }
-
-  SpreadsheetApp.flush();
-  return { success: true, score: finalScore };
-
-    } catch(err) {
-      return { success: false, message: 'Gagal menyimpan: ' + err.toString() };
+      SpreadsheetApp.flush();
+      return { success: true, score: finalScore };
     } finally {
-      lock.releaseLock();
+      try { lock.releaseLock(); } catch (e) {}
     }
+
+  } catch (err) {
+    return { success: false, message: 'Gagal menyimpan: ' + err.toString() };
   }
+}
 
 function logViolation(userID, examID, count, details) {
   const lock = LockService.getScriptLock();
-  try { lock.waitLock(8000); } catch(e) { return { forceSubmit: true }; }
+  let gotLock = false;
+  try {
+    gotLock = (typeof lock.tryLock === 'function')
+      ? lock.tryLock(4000)
+      : (lock.waitLock(4000), true);
+  } catch (e) {
+    gotLock = false;
+  }
+  if (!gotLock) return { forceSubmit: true };
+
   try {
     SS.getSheetByName('Logs').appendRow(['LOG-' + Date.now(), userID, examID, count || 1, details, new Date()]);
 
-    // Pastikan status siswa di sheet Responses langsung tercatat 'Curang'
+    // Pastikan status siswa di sheet Responses langsung tercatat 'Curang' (baca hanya kolom B:C)
     const rSheet = SS.getSheetByName('Responses');
     if (rSheet) {
-      const rData = rSheet.getDataRange().getValues();
+      const lastRow = rSheet.getLastRow();
       let foundRow = -1;
-      for (let i = 1; i < rData.length; i++) {
-        if (String(rData[i][1]).trim() === String(userID).trim() &&
-            String(rData[i][2]).trim() === String(examID).trim()) {
-          foundRow = i + 1;
-          break;
+      if (lastRow > 1) {
+        const rIds = rSheet.getRange(2, 2, lastRow - 1, 2).getValues();
+        for (let i = 0; i < rIds.length; i++) {
+          if (String(rIds[i][0]).trim() === String(userID).trim() &&
+              String(rIds[i][1]).trim() === String(examID).trim()) {
+            foundRow = i + 2;
+            break;
+          }
         }
       }
       if (foundRow !== -1) {
-        rSheet.getRange(foundRow, 7).setValue(new Date());
-        rSheet.getRange(foundRow, 8).setValue('Curang');
+        rSheet.getRange(foundRow, 7, 1, 2).setValues([[new Date(), 'Curang']]);
       } else {
         rSheet.appendRow(['RSP-' + Date.now(), userID, examID, '{}', 0, new Date(), new Date(), 'Curang']);
       }
     }
     SpreadsheetApp.flush();
   } finally {
-    lock.releaseLock();
+    try { lock.releaseLock(); } catch (e) {}
   }
   return { forceSubmit: true };
 }
@@ -1210,7 +1341,7 @@ function createExam(form, userID, token) {
     JSON.stringify(shuffleConfig),
     examName
   ]);
-  
+  invalidateAppCache_({ exams: true });
   return { success: true };
 }
 
@@ -1235,15 +1366,14 @@ function getExamList(userID, token) {
        role = userRows[u][3]; // Kolom Role
        
     if (role === 'Guru') {
-         const rawData = String(userRows[u][4] || '');
-         const assignments = rawData.split(',');
-         assignments.forEach(item => {
-           const parts = item.split(':');
-           if (parts.length >= 2) {
-             teacherSubjects.push({
-               subject: parts[0].trim().toLowerCase(),
-               kelas: parts[1].trim().toLowerCase()
-             });
+         const parsedAssign = (typeof parseTeacherAssignmentsRaw_ === 'function')
+           ? parseTeacherAssignmentsRaw_(userRows[u][4])
+           : [];
+         parsedAssign.forEach(a => {
+           const sub = String(a.subject || '').trim().toLowerCase();
+           const kls = String(a.kelas || '').trim().toLowerCase();
+           if (sub || kls) {
+             teacherSubjects.push({ subject: sub, kelas: kls });
            }
          });
        }
@@ -1370,7 +1500,7 @@ function addQuestion(data) {
     isRequired, 
     point // Kolom baru untuk bobot nilai
   ]);
-  
+  invalidateAppCache_({ examId: data.examId });
   return { success: true };
 }
 
@@ -1422,9 +1552,15 @@ function getQuestionsByExam(examID, userID, token) {
 function deleteQuestion(qId) {
   const sheet = SS.getSheetByName('Questions');
   const data = sheet.getDataRange().getValues();
+  let deletedExamId = '';
   for(let i=1; i<data.length; i++) {
-    if(data[i][0] == qId) { sheet.deleteRow(i+1); break; }
+    if(data[i][0] == qId) {
+      deletedExamId = String(data[i][1] || '');
+      sheet.deleteRow(i+1);
+      break;
+    }
   }
+  if (deletedExamId) invalidateAppCache_({ examId: deletedExamId });
   return { success: true };
 }
 
@@ -1583,6 +1719,7 @@ function importQuestionsFromForm(examID, formURL) {
         return { success: false, message: 'Form ditemukan tapi tidak ada soal Pilihan Ganda/Isian.' };
     }
 
+    invalidateAppCache_({ examId: examID });
     return { success: true, count: count };
 
   } catch (e) {
@@ -1595,46 +1732,104 @@ function importQuestionsFromForm(examID, formURL) {
   }
 }
 
-function copyQuestions(sourceExamId, destinationExamId) {
+function copyQuestions(sourceExamId, destinationExamId, requestorID, requestorToken) {
+  const srcId = String(sourceExamId || '').trim();
+  const dstId = String(destinationExamId || '').trim();
+
+  // 1. Validasi Input Dasar
+  if (!srcId || !dstId || srcId === dstId) {
+    return { success: false, message: 'ID Ujian Sumber dan Tujuan tidak valid atau sama.' };
+  }
+
+  // 2. Validasi Akses Admin & Guru terhadap Jadwal Sumber dan Tujuan
+  const srcAccess = verifyExamWriteAccess_(srcId, requestorID, requestorToken);
+  if (!srcAccess.allowed) {
+    return { success: false, message: 'Akses Sumber Ditolak: ' + (srcAccess.message || 'Tidak memiliki izin.') };
+  }
+  const dstAccess = verifyExamWriteAccess_(dstId, requestorID, requestorToken);
+  if (!dstAccess.allowed) {
+    return { success: false, message: 'Akses Tujuan Ditolak: ' + (dstAccess.message || 'Tidak memiliki izin.') };
+  }
+
+  const lock = LockService.getScriptLock();
   try {
-    // 1. Validasi Input
-    if (!sourceExamId || !destinationExamId || sourceExamId === destinationExamId) {
-      return { success: false, message: 'ID Ujian Sumber dan Tujuan tidak valid atau sama.' };
+    lock.waitLock(10000);
+  } catch (lockErr) {
+    return { success: false, message: 'Server sedang sibuk, silakan coba lagi.' };
+  }
+
+  try {
+    const sheet = SS.getSheetByName('Questions');
+    if (!sheet || sheet.getLastRow() <= 1) {
+      return { success: false, message: 'Tidak ada soal yang ditemukan di mapel sumber.' };
     }
 
-    const sheet = SS.getSheetByName('Questions');
-    const allData = sheet.getDataRange().getValues();
-    const header = allData.shift(); // Ambil header, sisakan data
+    // Pastikan header kolom ke-9 ('Point') tersedia di sheet Questions
+    if (sheet.getLastColumn() < 9 || !sheet.getRange(1, 9).getValue()) {
+      sheet.getRange(1, 9).setValue('Point').setFontWeight('bold').setBackground('#e2e8f0');
+    }
 
-    // 2. Filter soal dari sumber
-    const sourceQuestions = allData.filter(row => row[1] === sourceExamId);
+    const allData = sheet.getDataRange().getValues();
+    allData.shift(); // Buang baris header
+
+    // 3. Filter soal dari sumber secara aman
+    const sourceQuestions = allData.filter(row => String(row[1] || '').trim() === srcId);
 
     if (sourceQuestions.length === 0) {
       return { success: false, message: 'Tidak ada soal yang ditemukan di mapel sumber.' };
     }
 
-    // 3. Buat baris baru untuk tujuan
-    const newRows = sourceQuestions.map(sourceRow => {
-      let newRow = [...sourceRow]; // Salin semua data dari baris sumber
-      // Ganti QuestionID dengan yang baru & unik
-      newRow[0] = 'Q-' + Date.now() + '-' + Math.round(Math.random() * 100000);
-      // Ganti ExamID dengan ID tujuan
-      newRow[1] = destinationExamId;
-      return newRow;
+    // 4. Normalisasi tepat 9 kolom: [QuestionID, ExamID, Type, Content, ImageURL, Options, CorrectAnswer, IsRequired, Point]
+    const nowTs = Date.now();
+    const newRows = sourceQuestions.map((sourceRow, idx) => {
+      const newQuestionId = 'Q-' + nowTs + '-' + idx + '-' + Math.floor(Math.random() * 10000);
+      const qType = (sourceRow[2] !== undefined && sourceRow[2] !== '') ? sourceRow[2] : 'PG';
+      const qContent = sourceRow[3] !== undefined ? sourceRow[3] : '';
+      const qImage = sourceRow[4] !== undefined ? sourceRow[4] : '';
+      const qOptions = (sourceRow[5] !== undefined && sourceRow[5] !== '') ? sourceRow[5] : '[]';
+      const qCorrect = sourceRow[6] !== undefined ? sourceRow[6] : '';
+      const qRequired = (sourceRow.length > 7 && sourceRow[7] !== '' && sourceRow[7] !== null && sourceRow[7] !== undefined)
+        ? sourceRow[7]
+        : 'TRUE';
+      const rawPt = (sourceRow.length > 8 && sourceRow[8] !== '' && sourceRow[8] !== null && sourceRow[8] !== undefined)
+        ? parseFloat(String(sourceRow[8]).replace(',', '.'))
+        : NaN;
+      const qPoint = (!isNaN(rawPt) && rawPt > 0) ? rawPt : 10;
+
+      return [
+        newQuestionId,
+        dstId,
+        qType,
+        qContent,
+        qImage,
+        qOptions,
+        qCorrect,
+        qRequired,
+        qPoint
+      ];
     });
 
-    // 4. Lakukan penulisan massal (batch write)
+    // 5. Penulisan massal (batch write) & flush
     if (newRows.length > 0) {
-      sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, newRows[0].length)
+      sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, 9)
            .setValues(newRows);
+      SpreadsheetApp.flush();
     }
 
-    // 5. Kembalikan hasil sukses
-    return { success: true, count: newRows.length };
+    invalidateAppCache_({ examId: dstId });
+
+    return {
+      success: true,
+      count: newRows.length,
+      destinationExamId: dstId,
+      message: `${newRows.length} soal berhasil disalin.`
+    };
 
   } catch (e) {
     Logger.log('Gagal menyalin soal: ' + e.toString());
     return { success: false, message: 'Terjadi error di server: ' + e.message };
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
   }
 }
 
@@ -1659,6 +1854,7 @@ function deleteExam(examId, userID, token) {
 
       // 2. Hapus Baris
       sheet.deleteRow(i + 1);
+      invalidateAppCache_({ exams: true, examId: examId });
       return { success: true };
     }
   }
@@ -1673,7 +1869,8 @@ function toggleExamStatus(examId, newStatus) {
   for (let i = 1; i < data.length; i++) {
     if (String(data[i][0]) === String(examId)) {
       // Col 6 = Status (sesuai schema awal: ExamID, Subject, Class, Date, Duration, PIN, Status)
-      sheet.getRange(i + 1, 7).setValue(newStatus); 
+      sheet.getRange(i + 1, 7).setValue(newStatus);
+      invalidateAppCache_({ exams: true });
       return { success: true };
     }
   }
@@ -1734,6 +1931,7 @@ function updateExam(data, userID, token) {
       }
       // =========================================
       
+      invalidateAppCache_({ exams: true });
       return { success: true };
     }
   }
@@ -1757,6 +1955,7 @@ function updateQuestion(data) {
     // Cek jika ID Soal (Kolom 0) cocok dengan ID yang dikirim
     if (String(rows[i][0]) === String(data.questionId)) {
       const rowIdx = i + 1;
+      const examIdOfQ = String(rows[i][1] || '');
       
       // Persiapan Data untuk disimpan
       const opts = JSON.stringify(data.options || []);
@@ -1783,6 +1982,7 @@ function updateQuestion(data) {
       sheet.getRange(rowIdx, 8).setValue(isRequired);
       sheet.getRange(rowIdx, 9).setValue(point); // Simpan perubahan bobot
       
+      invalidateAppCache_({ examId: examIdOfQ || data.examId });
       return { success: true };
     }
   }
@@ -2162,6 +2362,7 @@ function saveImportedQuestions(examID, questionsData) {
       SpreadsheetApp.flush();
     }
 
+    invalidateAppCache_({ examId: examID });
     return { success: true, count: count };
     
   } catch (e) {
@@ -4174,21 +4375,11 @@ function deleteSavedImage(imageId) {
    FITUR KONFIGURASI (LOGO & JUDUL)
    ========================================== */
 
-// 1. Ambil Konfigurasi untuk Frontend
+// 1. Ambil Konfigurasi untuk Frontend (Menggunakan CACHE_CONFIG TTL 300s)
 function getAppConfig() {
   const sheet = SS.getSheetByName('Konfigurasi');
   if (!sheet) return { success: false, message: 'Sheet Konfigurasi tidak ditemukan' };
-  
-  const data = sheet.getDataRange().getValues();
-  const config = {};
-  
-  // Skip header, loop dari baris ke-2
-  for (let i = 1; i < data.length; i++) {
-    const key = data[i][0];
-    const val = data[i][1];
-    config[key] = val;
-  }
-  
+  const config = getCachedConfigMap_();
   return { success: true, data: config };
 }
 
@@ -4226,25 +4417,19 @@ function saveAppConfig(formObject) {
     updateOrAppend('show_exam_result', formObject.showExamResult === 'true' ? 'true' : 'false');
     updateOrAppend('maintenance_mode', formObject.maintenanceMode === 'true' ? 'true' : 'false');
     
+    invalidateAppCache_({ config: true });
     return { success: true, message: 'Konfigurasi berhasil disimpan!' };
   } catch (e) {
     return { success: false, message: 'Error: ' + e.toString() };
   }
 }
 
-// Helper: Cek status Maintenance Mode untuk client
+// Helper: Cek status Maintenance Mode untuk client (Menggunakan CACHE_CONFIG)
 function getMaintenanceStatus() {
   try {
-    const cfgSheet = SS.getSheetByName('Konfigurasi');
-    if (!cfgSheet) return { success: true, maintenanceMode: false };
-    const cfgData = cfgSheet.getDataRange().getValues();
-    for (let c = 1; c < cfgData.length; c++) {
-      if (String(cfgData[c][0]).trim() === 'maintenance_mode') {
-        const isMaint = String(cfgData[c][1]).trim().toLowerCase() === 'true';
-        return { success: true, maintenanceMode: isMaint };
-      }
-    }
-    return { success: true, maintenanceMode: false };
+    const cfgMap = getCachedConfigMap_();
+    const isMaint = String(cfgMap.maintenance_mode || '').trim().toLowerCase() === 'true';
+    return { success: true, maintenanceMode: isMaint };
   } catch (e) {
     return { success: false, message: e.toString(), maintenanceMode: false };
   }
@@ -4902,14 +5087,20 @@ function deleteQuestionsBulk(ids) {
   const data = sheet.getDataRange().getValues();
 
   const rowsToDelete = [];
+  const affectedExams = new Set();
   for (let i = 1; i < data.length; i++) {
     if (ids.includes(String(data[i][0]))) {
       rowsToDelete.push(i + 1);
+      if (data[i][1]) affectedExams.add(String(data[i][1]).trim());
     }
   }
 
   rowsToDelete.sort((a, b) => b - a);
   rowsToDelete.forEach(rowNum => sheet.deleteRow(rowNum));
+
+  if (affectedExams.size > 0) {
+    invalidateAppCache_({ examIds: Array.from(affectedExams) });
+  }
 
   return { success: true, deleted: rowsToDelete.length };
 }
@@ -6239,8 +6430,9 @@ function buildExamAnalysisHTML_(payload) {
     return Number.isInteger(n) ? String(n) : n.toFixed(1);
   };
 
-  // Bagi soal per maksimal 25 kolom agar tidak terpotong di A4 Landscape
-  const COLS_PER_CHUNK = 25;
+  // Tampilkan seluruh soal mata pelajaran hingga 50 nomor per lebar halaman A4 Landscape
+  // sehingga rentang sub-judul & header tabel dinamis (SOAL 1-15, SOAL 1-30, SOAL 1-50, dst.)
+  const COLS_PER_CHUNK = 50;
   const questionChunks = [];
   if (questions.length === 0) {
     questionChunks.push({ startNo: 0, endNo: 0, startIdx: 0, items: [] });
@@ -6418,8 +6610,36 @@ function buildExamAnalysisHTML_(payload) {
     if (pg.type === 'table') {
       const qCols = chunk.items;
       const qCount = qCols.length;
-      const isDense = qCount > 18;
-      const tblClass = isDense ? 'analysis-table dense' : 'analysis-table';
+      const qEff = Math.max(qCount, 1);
+      let tblClass = 'analysis-table';
+      if (qCount > 35) tblClass = 'analysis-table ultra-dense';
+      else if (qCount > 18) tblClass = 'analysis-table dense';
+
+      // Hitung lebar kolom persentase presisi 100.0000% agar No, NISN, Nama, Soal 1-50, Total, PG, Nilai, Keterangan
+      // muat penuh dalam satu lebar halaman A4 Landscape (297mm x 210mm) tanpa terpotong ke samping
+      let wNo = 2.4, wNisn = 7.2, wNama = 19.4, wTotal = 3.8, wPg = 4.4, wNilai = 4.4, wKet = 6.4;
+      if (qCount > 35) {
+        wNo = 2.0; wNisn = 6.4; wNama = 13.6; wTotal = 3.2; wPg = 3.4; wNilai = 3.4; wKet = 4.0;
+      } else if (qCount > 18) {
+        wNo = 2.2; wNisn = 6.8; wNama = 15.8; wTotal = 3.4; wPg = 3.8; wNilai = 3.8; wKet = 5.2;
+      }
+      const qAreaPct = Number((100 - (wNo + wNisn + wNama + wTotal + wPg + wNilai + wKet)).toFixed(4));
+      const eachQPct = Number((qAreaPct / qEff).toFixed(4));
+      const qLastPct = Number((qAreaPct - eachQPct * (qEff - 1)).toFixed(4));
+
+      let colgroupHtml = `<colgroup>
+        <col style="width:${wNo}%">
+        <col style="width:${wNisn}%">
+        <col style="width:${wNama}%">`;
+      for (let qi = 0; qi < qEff; qi++) {
+        colgroupHtml += `<col style="width:${qi === qEff - 1 ? qLastPct : eachQPct}%">`;
+      }
+      colgroupHtml += `
+        <col style="width:${wTotal}%">
+        <col style="width:${wPg}%">
+        <col style="width:${wNilai}%">
+        <col style="width:${wKet}%">
+      </colgroup>`;
 
       let qNumHeaders = '';
       if (qCount > 0) {
@@ -6432,7 +6652,7 @@ function buildExamAnalysisHTML_(payload) {
 
       let studentRowsHtml = '';
       if (pg.studentSlice.length === 0) {
-        studentRowsHtml = `<tr><td colspan="${Math.max(qCount, 1) + 7}" style="text-align:center; padding:16px; color:#64748b;">Belum ada data siswa pada kelas ini.</td></tr>`;
+        studentRowsHtml = `<tr><td colspan="${qEff + 7}" style="text-align:center; padding:16px; color:#64748b;">Belum ada data siswa pada kelas ini.</td></tr>`;
       } else {
         pg.studentSlice.forEach(stu => {
           let ansCells = '';
@@ -6498,12 +6718,13 @@ function buildExamAnalysisHTML_(payload) {
 
       bodyHtml = `
         <table class="${tblClass}">
+          ${colgroupHtml}
           <thead>
             <tr>
               <th rowspan="2" class="col-no">No</th>
               <th rowspan="2" class="col-nisn">NISN</th>
               <th rowspan="2" class="col-nama">Nama Lengkap Siswa</th>
-              <th colspan="${Math.max(qCount, 1)}" class="th-soal-group">Soal No. ${qCount > 0 ? (chunk.startNo + ' &ndash; ' + chunk.endNo) : '-'}</th>
+              <th colspan="${qEff}" class="th-soal-group">Soal No. ${qCount > 0 ? (chunk.startNo + ' - ' + chunk.endNo) : '-'}</th>
               <th rowspan="2" class="col-total">Total</th>
               <th rowspan="2" class="col-pg">PG</th>
               <th rowspan="2" class="col-nilai">Nilai</th>
@@ -6536,7 +6757,7 @@ function buildExamAnalysisHTML_(payload) {
   <style>
     @page {
       size: A4 landscape;
-      margin: 8mm 9mm;
+      margin: 5mm 6mm;
     }
     * { box-sizing: border-box; }
     body {
@@ -6632,7 +6853,7 @@ function buildExamAnalysisHTML_(payload) {
       padding: 1px 2px;
     }
 
-    /* TABEL ANALISIS */
+    /* TABEL ANALISIS (A4 LANDSCAPE 100% WIDTH PRESISI) */
     .analysis-table {
       width: 100%;
       border-collapse: collapse;
@@ -6640,7 +6861,10 @@ function buildExamAnalysisHTML_(payload) {
       font-size: 8.5px;
     }
     .analysis-table.dense {
-      font-size: 7.5px;
+      font-size: 7.2px;
+    }
+    .analysis-table.ultra-dense {
+      font-size: 6.2px;
     }
     .analysis-table th,
     .analysis-table td {
@@ -6654,7 +6878,14 @@ function buildExamAnalysisHTML_(payload) {
     }
     .analysis-table.dense th,
     .analysis-table.dense td {
-      padding: 3px 1px;
+      padding: 2.8px 1px;
+    }
+    .analysis-table.ultra-dense th,
+    .analysis-table.ultra-dense td {
+      padding: 2.2px 0.5px;
+    }
+    .analysis-table tr {
+      page-break-inside: avoid;
     }
     .analysis-table thead th {
       background-color: #dce6f1;
@@ -6665,31 +6896,31 @@ function buildExamAnalysisHTML_(payload) {
       background-color: #cfe0f5 !important;
       font-size: 8.5px;
     }
+    .analysis-table.ultra-dense .th-soal-group {
+      font-size: 7.5px;
+    }
 
-    .col-no { width: 22px; }
-    .col-nisn { width: 66px; }
     .col-nama {
-      width: 155px;
       text-align: left !important;
-      padding-left: 5px !important;
+      padding-left: 4px !important;
       font-weight: bold;
     }
-    .analysis-table.dense .col-nama {
-      width: 132px;
-    }
     .col-q { font-weight: bold; }
-    .col-total { width: 32px; font-weight: bold; }
-    .col-pg { width: 36px; }
+    .col-total { font-weight: bold; }
     .col-nilai {
-      width: 38px;
       font-weight: bold;
       color: #1e3a8a;
       background-color: #eff6ff;
     }
     .col-ket {
-      width: 58px;
       font-weight: bold;
       font-size: 7.5px;
+    }
+    .analysis-table.dense .col-ket {
+      font-size: 6.8px;
+    }
+    .analysis-table.ultra-dense .col-ket {
+      font-size: 5.8px;
     }
 
     /* WARNA STATUS JAWABAN */
@@ -6898,6 +7129,7 @@ function distributeQuestionWeightsEqual(examID, requestorID, requestorToken) {
     // Tulis seluruh kolom Point secara batch dalam 1 panggilan
     sheet.getRange(2, 9, lastRow - 1, 1).setValues(pointCol);
     SpreadsheetApp.flush();
+    invalidateAppCache_({ examId: examID });
 
     return {
       success: true,
@@ -6963,6 +7195,7 @@ function updateSingleQuestionPoint(questionId, newPoint, requestorID, requestorT
 
     sheet.getRange(targetRow, 9).setValue(cleanPoint);
     SpreadsheetApp.flush();
+    invalidateAppCache_({ examId: examIdFound });
 
     return {
       success: true,
@@ -7155,6 +7388,7 @@ function restoreSystemDatabase(backupPayload, requestorID, requestorToken) {
     });
 
     SpreadsheetApp.flush();
+    invalidateAppCache_({ all: true });
 
     return {
       success: true,
